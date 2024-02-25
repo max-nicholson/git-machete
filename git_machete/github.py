@@ -12,6 +12,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from .exceptions import (MacheteException, UnexpectedMacheteException,
                          UnprocessableEntityHTTPError)
 from .git_operations import LocalBranchShortName
+from .platform import Domain, find_access_token_for_domain
 from .utils import bold, compact_dict, debug, popen_cmd, warn
 
 
@@ -66,6 +67,13 @@ class OrganizationAndRepositoryAndRemote(NamedTuple):
     remote: str
 
 
+class GitHubDomain(Domain):
+    DEFAULT = 'github.com'
+
+    def __init__(self, value: Optional[str]) -> None:
+        self.value = value or self.DEFAULT
+
+
 GITHUB_TOKEN_ENV_VAR = 'GITHUB_TOKEN'
 
 
@@ -99,18 +107,11 @@ class GitHubToken(NamedTuple):
         if os.path.isfile(file_full_path):
             debug(f"  File `{file_full_path}` exists")
             with open(file_full_path) as file:
-                # ~/.github-token is a file with a structure similar to:
-                #
-                # ghp_mytoken_for_github_com
-                # ghp_myothertoken_for_git_example_org git.example.org
-                # ghp_yetanothertoken_for_git_example_com git.example.com
+                github_domain = GitHubDomain(domain)
+                token = find_access_token_for_domain(file.readlines(), github_domain)
+                if token:
+                    return cls(value=token, provider=provider)
 
-                for line in file.readlines():
-                    if line.rstrip().endswith(" " + domain):
-                        token = line.split(" ")[0]
-                        return cls(value=token, provider=provider)
-                    elif domain == GitHubClient.DEFAULT_GITHUB_DOMAIN and " " not in line.rstrip():
-                        return cls(value=line.rstrip(), provider=provider)
         return None
 
     @classmethod
