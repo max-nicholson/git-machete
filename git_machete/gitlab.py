@@ -1,13 +1,14 @@
 import os
 import re
 import shutil
+import urllib.parse
 from typing import NamedTuple, Optional, Tuple
 from typing_extensions import Self
 
 
 from .exceptions import UnexpectedMacheteException
-from .platform import AccessToken, Domain, find_access_token_for_domain
-from .utils import debug, popen_cmd
+from .platform import AccessToken, Domain, Platform, PlatformClient, find_access_token_for_domain
+from .utils import debug, popen_cmd, slurp_file
 
 
 class GitLabDomain(Domain):
@@ -16,8 +17,16 @@ class GitLabDomain(Domain):
     def __init__(self, value: Optional[str]) -> None:
         self.value = value or self.DEFAULT
 
+    def url_prefix_for(self, *, path: str) -> str:
+        return f'https://{self.value}{"/api" if path == "/graphql" else "/api/v4"}'
+
+
+class GitLabPlatform(Platform):
+    ALIAS = 'GitLab'
+
 
 # Same as glab CLI tool
+# https://gitlab.com/gitlab-org/cli/-/blob/6ac665d5891eb2044a09488f39a1125822b872a3/internal/config/config_mapping.go#L37
 GITLAB_TOKEN_ENV_VAR = 'GITLAB_TOKEN'
 
 
@@ -114,3 +123,106 @@ class GitLabToken(NamedTuple):
         return (f'\n\t1. `{GITLAB_TOKEN_ENV_VAR}` environment variable\n'
                 '\t2. Content of the `~/.gitlab-token` file\n'
                 '\t3. Current auth token from the `glab` GitLab CLI\n')
+
+class GitLabCurrentUser(NamedTuple):
+    username: str
+
+    def __str__(self) -> str:
+        return self.username
+
+    @classmethod
+    def from_json(cls, json: dict) -> Self:
+        return cls(username=json['username'])
+
+
+class GitLabMergeRequest(NamedTuple):
+    @staticmethod
+    def template(*, project_root: str) -> Optional[str]:
+        # https://docs.gitlab.com/ee/user/project/description_templates.html#create-a-merge-request-template
+        # https://docs.gitlab.com/ee/user/project/description_templates.html#set-a-default-template-for-merge-requests-and-issues
+        # Actual MR template resolution for GitLab has a complex hierarchy of templates, including
+        # project-level, group-level and instance-level templates - and also the ability to "choose"
+        # a template
+        # To keep things simple, we'll only support the "Default.md" template for now
+        # (similar to GitHub), but could consider prompting to select a template e.g. glab CLI
+        # https://gitlab.com/gitlab-org/cli/-/blob/6ac665d5891eb2044a09488f39a1125822b872a3/commands/mr/create/mr_create.go#L399
+        # or a config setting
+        template_path = os.path.join(project_root, '.gitlab', 'merge_request_templates', 'Default.md')
+        if os.path.isfile(template_path):
+                return slurp_file(template_path)
+
+
+"""
+A namespace contains a collection of projects and/or groups, and is either:
+- a user's personal namespace e.g. https://gitlab.example.com/alex
+- a group namespace e.g. https://gitlab.example.com/my-group
+- a subgroup namespace e.g. https://gitlab.example.com/my-group/my-subgroup/my-subsubgroup
+
+In the 3rd case, there can be up to 20 levels of nesting
+
+https://docs.gitlab.com/ee/user/namespace/
+"""
+class Namespace(NamedTuple):
+    full_path: str
+
+
+class Project(NamedTuple):
+    id: Optional[str]
+    path: Optional[str]
+    namespace: Optional[Namespace]
+
+    @property
+    def path_with_namespace(self) -> Optional[str]:
+        return f'{self.namespace.full_path}/{self.path}' if self.namespace and self.path else None
+
+    def uri_param(self) -> str:
+        if self.id:
+            return self.id
+
+        if self.path_with_namespace:
+            # https://docs.gitlab.com/ee/api/rest/index.html#namespaced-path-encoding
+            return urllib.parse.quote(self.path_with_namespace, safe='')
+
+        raise UnexpectedMacheteException("Cannot generate a URL param for a project without an ID or a path with namespace")
+
+
+class GitLabClient(PlatformClient):
+    DEFAULT_HEADERS = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'git-machete',
+        'Accept': 'application/json',
+    }
+
+    def __init__(self, domain: GitLabDomain, project: Project) -> None:
+        self.__domain = domain
+        self.__project = project
+        self.__token: Optional[GitLabToken] = GitLabToken.for_domain(domain)
+
+    def get_current_user_login(self) -> Optional[str]:
+        if not self.__token:
+            return None
+
+        # https://docs.gitlab.com/ee/api/users.html#list-current-user
+        current_user = GitLabCurrentUser.from_json(self.__fire_api_request('GET', '/user'))
+        return current_user.username
+
+    def create_merge_request(self, *, head: str, base: str, title: str, description: str, is_draft: bool) -> None:
+        if not self.__token:
+            raise UnexpectedMacheteException("Cannot create a merge request without a GitLab token")
+
+        # https://docs.gitlab.com/ee/api/merge_requests.html#create-mr
+        self.__fire_api_request(
+            'POST',
+            f'/projects/{self.__project.uri_param()}/merge_requests',
+            request_body={
+                'source_branch': head,
+                'target_branch': base,
+                # NB: No `draft` param in the API, can only be achieved with a prefix in the title
+                # https://docs.gitlab.com/ee/user/project/merge_requests/drafts.html#mark-merge-requests-as-drafts
+                # "Creating or editing a merge request: Add [Draft], Draft: or (Draft) to the
+                # beginning of the merge request’s title, or select Mark as draft below the Title
+                # field."
+                'title': title if not is_draft else f'[Draft] {title}',
+                'description': description,
+            }
+        )
